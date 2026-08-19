@@ -1,6 +1,6 @@
 # 3D 场景建设 Skill / Workflow（供 Agent 阅读）
 
-> 适用范围：程序化生成 3D 场景（参考栈：Bevy 0.18 + Rust；方法论适用于任何引擎）。
+> 适用范围：程序化生成 3D 场景（参考栈：Bevy 0.19 + Rust；方法论适用于任何引擎）。
 > 核心原则：**规划先行 → 坐标推导 → 确定性变化 → 渲染验证闭环 → 迭代交付**。
 > 参考实现：本仓库（chapel，半塌小教堂）与 warbell 项目（视觉管线来源）。
 
@@ -12,7 +12,7 @@
 
 | # | 问题 | 默认值（仅当用户明确说"随便/你定"时才可使用） |
 |---|------|------|
-| 1 | **引擎与版本** | Bevy 0.18（注意：0.19 需 rustc 1.95+，见附录 A） |
+| 1 | **引擎与版本** | Bevy 0.19（需 rustc ≥1.95；沙箱 rustc <1.95 时降级 0.18，见附录 B API 差异） |
 | 2 | **场景主体** | 无默认，必问（建筑？废墟？自然景观？室内？） |
 | 3 | **风格参考** | 低多边形 + 顶点色（warbell 风）；用户给参考项目则优先参考 |
 | 4 | **尺度单位** | 真实米制（1 单位 = 1m），人高约 1.7m 作基准 |
@@ -69,7 +69,49 @@ pub const STONE:       u32 = 0x9a968a; // 风化石·中
 pub const STONE_DARK:  u32 = 0x6f6b62; // 风化石·暗
 ```
 
-### 1.5 参照物清单 + 光照参数
+### 1.5 参照物清单 + 光照参数（与 warbell 视觉管线对齐，禁止留空）
+
+**参照物（强烈建议保留，消除"玩具感"= 没有参照物）**：
+
+| 参照物 | 作用 | 建议密度 / 数量 |
+|--------|------|----------------|
+| 独立树（树干 + 2 层锥形冠） | 提供尺度锚点（树高≈5m → 墙面能心算出高度） | 场景外围 8~12 棵，呈不规则环形 |
+| 草丛 / 草簇（小方块/扁块） | 填充地面单调感，打破"平面=游戏地图"感 | 30~60 块，避开建筑入口 ±5m |
+| 碎石（小立方体，随机旋转+暗色） | 物理直觉：有坍塌就该有碎块在对应墙脚 | 20~40 块，集中在破损最严重的墙面 ±2m 内 |
+| 铺地石板碎片（薄 slab，随机倾斜） | 表明"此处曾经是广场/步道"，增加年代感 | 10~15 块，在入口扇形区域 |
+
+**光照参数（warbell 风格正午暖阳，数值直接抄）**：
+
+```rust
+// 平行光 —— 暖阳 + 长阴影
+DirectionalLight {
+    illuminance: 40_000.0,                         // 标准正午，10000=阴天，100000=赤道烈日
+    color: Color::srgb(1.0, 0.96, 0.88),           // 偏黄 0.96/0.88，不要纯白
+    shadow_maps_enabled: true,                      // 0.19 字段名，没阴影=一切漂在空中
+    ..default()
+}
+// Transform 角度：约从西南-西北方向射下，让东侧/北侧墙面落阴
+// Quat::from_euler(EulerRot::XYZ, -0.9, -0.9, -0.3)
+
+// 环境光 —— 冷色补光，中和暖太阳的黄
+GlobalAmbientLight {
+    color: Color::srgb(0.62, 0.68, 0.8),           // 浅蓝紫，0.68/0.8 是天空散射色
+    brightness: 900.0,                              // 900 以下会暗，1200 以上发灰
+    ..default()
+}
+
+// 距离雾 —— 暖灰调（陷阱：千万别用天空蓝！）
+DistanceFog {
+    color: Color::srgb(0.85, 0.80, 0.66),           // 奶油雾 0x85_80_66 类
+    directional_light_color: Color::srgb(0.95, 0.92, 0.84),
+    directional_light_exponent: 6.0,                 // 越大=阳光散射越窄
+    falloff: FogFalloff::ExponentialSquared { density: 0.009 },  // 截图场景默认 0.009
+    ..default()
+}
+
+// 天空清色（ClearColor）—— 日间浅蓝，比雾色亮 1 档
+ClearColor(Color::srgb(0.70, 0.82, 0.93))
+```
 
 ---
 
@@ -126,27 +168,44 @@ let miss = if r < 0.5 && top_frac > 1.0 - drop { true } else { r < 0.05 };
 
 ## 第 4 阶段：光照与渲染管线（消除"玩具感"的第二战场）
 
-标准管线（缺任何一环都会翻车）：
+标准管线（缺任何一环都会翻车）。**以下为 Bevy 0.19 写法**（与 warbell `src/scene.rs` 对齐）：
 
 ```rust
-// 相机：HDR 是色调映射的前提
-(Camera3d, Camera { hdr: true, .. }, Exposure::INDOOR /* 或自定义 */)
+use bevy::camera::{Exposure, Hdr};      // 0.19: Hdr 是独立组件，在 camera 模块下
+use bevy::pbr::{DistanceFog, FogFalloff};
+use bevy::core_pipeline::tonemapping::Tonemapping;
+
+// 相机：Hdr 是独立组件（NOT Camera { hdr: true } — 0.17 以前老写法已移除）
+(
+    Camera3d::default(),
+    Hdr,
+    Exposure::INDOOR,            // 或自定义，无此项=室内暗室外过曝
+    Tonemapping::AgX,            // 色调映射：无此项=过曝发白或死黑
+)
 
 // 平行光：暖色太阳 + 阴影
 DirectionalLight {
     illuminance: 40_000.0,
     color: Color::srgb(1.0, 0.96, 0.88),  // 暖阳
-    shadows_enabled: true,                 // 无阴影=漂浮感
+    shadow_maps_enabled: true,             // 0.19: 字段改名，不是 shadows_enabled
+    ..default()
 }
 
 // 环境光：作为 Resource 插入（不是组件！）
 .insert_resource(GlobalAmbientLight {
     color: Color::srgb(0.62, 0.68, 0.8),
     brightness: 900.0,
+    ..default()
 })
 
-// 色调映射：无此项=过曝发白或死黑
-Tonemapping::AgX  // 或 TonyMcMapface
+// 距离雾：暖灰调，NOT 天空蓝（雾色陷阱见下文）
+DistanceFog {
+    color: Color::srgb(0.85, 0.80, 0.66), // 暖雾：阳光大气感，别用天空蓝
+    directional_light_color: Color::srgb(0.95, 0.92, 0.84),
+    directional_light_exponent: 6.0,
+    falloff: FogFalloff::ExponentialSquared { density: 0.009 },
+    ..default()
+}
 ```
 
 **雾色陷阱**：雾不要用天空蓝（整帧泛白），用暖灰调（`0x85_80_66` 类），读作"阳光大气"。
@@ -260,7 +319,7 @@ Tonemapping::AgX  // 或 TonyMcMapface
      层07 中段 ▓ 连续 → 后殿与中殿墙体衔接 ✓
 ```
 
-**为什么比截图探针更适合 Agent**：
+## 为什么比截图探针更适合 Agent
 - 截图像素受光照/雾/抗锯齿影响，颜色断言有误报；截面读的是**构建期真实数据**，零噪声
 - 截图只能验证"渲染出来什么样"，截面能定位到**具体哪块砖**错位
 - 截图只有相机一个视角；截面可任意方向、任意粒度切，覆盖相机看不到的死角
@@ -268,6 +327,9 @@ Tonemapping::AgX  // 或 TonyMcMapface
 - 不需要渲染管线存在（构建期即可跑），CI 环境友好
 
 **实现要点**：
+
+> ⚠️ **当前 chapel 项目状态**：`BlockInfo` 记录 + `slice()` 工具函数尚未落地实现。方案 D 是方法论级别的自查设计，下个场景或本项目迭代时建议优先补上（侵入极小，砌墙时 push 一条记录即可）。落地前，几何断言（方案 A）+ 人工截图自查仍是实际的验证闭环。
+
 ```rust
 // 构建期顺手记录（侵入最小）
 struct BlockInfo { x: f32, y: f32, z: f32, sx: f32, sy: f32, sz: f32, planned_hole: bool }
@@ -319,9 +381,9 @@ fn slice_diagonal(blocks: &[BlockInfo], dir: Vec3) -> CharGrid;               //
 | 砖块对不齐 | 手写魔法坐标 | 常量 + 公式推导（2.1） |
 | 墙面不闭合 | 角点不共享 | ±W/2 推导 + 角柱补缝（2.3） |
 | 玩具感强 | 高饱和色 + 无色调映射 + 无参照物 | 三管齐下（第 3、4 阶段 + 参照物） |
-| 画面过曝发白 | 缺 tonemapping / 相机非 HDR | hdr + AgX（第 4 阶段） |
+| 画面过曝发白 | 缺 tonemapping / 相机缺 Hdr 组件 | Hdr（bevy::camera::Hdr 独立组件） + Tonemapping::AgX（第 4 阶段） |
 | 画面死黑 | 环境光缺失或太弱 | GlobalAmbientLight 资源提亮 |
-| 物体"漂浮" | 阴影未开启 | shadows_enabled: true |
+| 物体"漂浮" | 阴影未开启 | shadow_maps_enabled: true（0.19 已改名，不是 shadows_enabled） |
 | 整帧泛白雾感 | 雾色用了天空蓝 | 雾用暖灰调 |
 | 破损看着假 | 均匀随机撒洞 | 缺损集中顶部 + 碎砖靠墙脚（2.5） |
 | 编译报 API 不存在 | Bevy 版本 API 变动 | 见附录 B |
@@ -345,18 +407,26 @@ opt-level = 3
 opt-level = 1
 ```
 
-**版本兼容**：Bevy 0.19 需 rustc ≥1.95（沙箱常是 1.92 → 用 0.18）。
+**版本兼容**：默认 Bevy 0.19（需 rustc ≥1.95）。沙箱/CI 环境若 rustc <1.95 则降级到 Bevy 0.18，API 差异详见附录 B。
 
-## 附录 B：Bevy 0.18 API 陷阱（实测踩坑记录）
+## 附录 B：Bevy 0.18→0.19 API 变动清单（实测踩坑 + warbell 0.19.1 对照）
 
-| 陷阱 | 正确写法 |
-|------|------|
-| `Color::rgb` 不存在 | `Color::srgb`（或 `Color::srgb_u8`） |
-| `bevy::render::mesh::Mesh` 私有 | `bevy::mesh::Mesh` |
-| `Mesh3d` 要 `Mesh` | 先 `meshes.add(mesh)` 拿 `Handle<Mesh>` |
-| `NotShadowCaster` 路径 | `bevy::light::NotShadowCaster` |
-| `GlobalAmbientLight` 用法 | `insert_resource(...)`，不是组件/不是 setup 参数 |
-| `AmbientLight.brightness` | 已并入 `GlobalAmbientLight` 资源 |
+> **源头权威**：warbell 项目 `Cargo.toml` 固定 `bevy = "0.19.1"`，`src/scene.rs` 是视觉管线源头，所有写法已与它对齐。chape​l 项目已验证编译通过。
+
+| 变动项 | 0.18 / 旧写法 | 0.19 正确写法（warbell 验证） | 备注 |
+|------|------|------|------|
+| **Hdr 组件路径** | `bevy::render::view::Hdr` 或老写法 `Camera { hdr: true }` | `use bevy::camera::Hdr;`，作为独立组件 spawn | 0.17 把 hdr 从 Camera 字段拆出来，0.19 又把模块从 render::view 移到 camera |
+| **平行光阴影开关** | `shadows_enabled: true` | `shadow_maps_enabled: true` | 编译时会有类似字段提示，但容易漏改 |
+| **DistanceFog 路径** | （0.18 同路径，但很多老教程写错到 bevy::render::fog 等） | `use bevy::pbr::{DistanceFog, FogFalloff};` | warbell `scene.rs` L18-L19 权威 |
+| **Exposure 路径** | `bevy::pbr::Exposure` 或写在 Camera 字段里 | `use bevy::camera::Exposure;`，作为独立组件 spawn | 与 Hdr 一起移到 camera 模块 |
+| **Tonemapping** | `bevy::render::camera::Tonemapping` | `use bevy::core_pipeline::tonemapping::Tonemapping;` | 独立组件，不加会过曝 |
+| **Color 构造** | `Color::rgb(1,1,1)` ❌ 不存在 | `Color::srgb(1.0, 0.96, 0.88)` 或 `Color::srgb_u8(0xb9, 0xb5, 0xa8)` | 0.18 已是如此，0.19 没变，但新手指南常写错 |
+| **Mesh 导入** | 老路径 `bevy::render::mesh::Mesh` | `use bevy::mesh::Mesh;` | 0.18 已是如此，0.19 没变 |
+| **NotShadowCaster 路径** | 各种乱路径 | `use bevy::light::NotShadowCaster;` | warbell `vista.rs` L16 验证 |
+| **GlobalAmbientLight** | 0.18 前是 AmbientLight 组件 | `.insert_resource(GlobalAmbientLight { color, brightness, ..default() })` | 是 Resource，不是组件；缺 brightness=画面死黑 |
+| **Resources-as-Components** | `#[derive(Resource, Component)]` 合法 | **不再允许**：Resource 是 Component 子 trait；一个类型不能同时双义 | 拆成 `MyDataComp(Component)` + `MyDataRes(Resource)` 两个类型 |
+| **bevy_scene 改名** | `bevy_scene` crate | 重命名为 `bevy_world_serialization`，代码里仍 `use bevy::scene::*`（prelude 重导出了名字不变） | 影响 Cargo.toml 单独引用场景 crate 的情况；prelude 正常用户无感 |
+| **edition 2024** | crate 可 edition=2021 | warbell 用 `edition = "2024"`（但 chapel 用 2021 也没问题） | 0.19 要求 rustc ≥1.95；2024 edition 不是强制项 |
 
 ## 附录 C：提示词模板（复制给下一个 Agent 即用）
 
@@ -386,11 +456,13 @@ opt-level = 1
 
 ## 附录 D：参考实现索引
 
-| 文件 | 作用 |
-|------|------|
-| `src/geoms.rs` | 调色板 + 图元 + 合并/着色工具（可复用配方库） |
-| `src/chapel.rs` | 布局常量、coused_wall 砌墙器、确定性破损、碎砖 |
-| `src/env.rs` | 地面、草地、碎石、树（参照物） |
-| `src/main.rs` | 应用骨架、光照管线、轨道相机 |
-| warbell `src/scene.rs` | 视觉管线源头（AgX/雾/环境光/阴影） |
-| warbell `src/meshkit.rs` | 合批配方源头 |
+| 文件 | 作用 | 0.19 关键 API（避坑） |
+|------|------|------|
+| `src/geoms.rs` | 调色板 + 图元 + 合并/着色工具（可复用配方库） | `merged_flat()` 合批配方：tinted → merge → duplicate_vertices → compute_flat_normals |
+| `src/chapel.rs` | 布局常量、coursed_wall 砌墙器、确定性破损、碎砖 | `hash2()` 确定性哈希；drop_frac 控制「缺损集中顶部」 |
+| `src/env.rs` | 地面、草地、碎石、树（参照物） | `build_tree()` 的 warbell 风格低模树：frustum 树干 + 两层 cone 树冠 |
+| `src/main.rs` | 应用骨架、光照管线、轨道相机 | **0.19 必须看**：`bevy::camera::Hdr`、`shadow_maps_enabled`、`bevy::pbr::DistanceFog` — 都是 0.19 新写法 |
+| warbell `src/scene.rs` | **视觉管线源头**（AgX/雾/环境光/阴影/IBL/Bloom） | 权威导入行（L6-L27）：<br>`use bevy::camera::{Exposure, Hdr};`<br>`use bevy::pbr::{AtmosphereSettings, ContactShadows, DistanceFog, FogFalloff, SSAO};`<br>`use bevy::light::{Atmosphere, CascadeShadowConfigBuilder, ...}` |
+| warbell `src/meshkit.rs` | **合批配方源头** | 与 chapel `geoms.rs` 思路一致：primitive → tint → merge → flat shade → 单白色材质 |
+| warbell `Cargo.toml` | Bevy 版本锚点 | `bevy = "0.19.1"`（不是浮动 0.19，固定小版本防 break） |
+| warbell `docs/specs/bevy-0-18-1-polished-static-3d-scene-verified-apis.md` | 0.18 管线验证文档 | 0.19 大部分可复用，但注意附录 B 的 API 改名表 |
